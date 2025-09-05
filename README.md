@@ -1,7 +1,7 @@
 # async-redis-lock
 
-[![Crates.io](https://img.shields.io/crates/v/async-redis-lock)](https://crates.io/crates/redis-lock)
-[![docs](https://img.shields.io/crates/v/async-redis-lock?color=yellow&label=docs)](https://docs.rs/redis-lock)
+[![Crates.io](https://img.shields.io/crates/v/async-redis-lock)](https://crates.io/crates/async-redis-lock)
+[![docs](https://img.shields.io/crates/v/async-redis-lock?color=orange&label=docs)](https://docs.rs/async-redis-lock)
 
 A simple and easy-to-use asynchronous redis distributed lock implementation based on tokio and redis-rs.
 
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     // 2. Background task automatically extends lock TTL
     // 3. Safe to perform critical operations
     // ...    
-    
+
     // Release lock explicitly
     // Alternative: drop(lock) for implicit release
     lock.release()?;
@@ -81,7 +81,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
-    
+
     // Build a custom lock options
     let opts = Options::new()
         // Set interval between acquisition attempts
@@ -96,15 +96,15 @@ async fn main() -> anyhow::Result<()> {
         .ttl(Duration::from_secs(3))
         // Set lock auto-extend interval
         // Default: 1s
-        // Recommend: lifetime/3
+        // Recommend: ttl/3
         .extend(Duration::from_secs(1));
-    
-     // Acquire lock with the custom options
+
+    // Acquire lock with the custom options
     let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
 
     // Perform operations that require locking
     // ...
-    
+
     Ok(())
 }
 ```
@@ -112,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
 ## Important Notes
 
 1. Don't ignore the return value of acquire method, or the lock will release immediately
-2. extend_interval must be less than lifetime to prevent unintended release
+2. If the extension interval is too large, the lock extension may fail because the lock has been passively released (by
+   expiration) before the extension attempt, the recommend is ttl/3
 3. Lock implements Drop trait and will auto-release when out of scope
 
 ## License

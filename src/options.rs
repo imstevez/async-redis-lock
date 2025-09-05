@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 const DEFAULT_RETRY: Duration = Duration::from_millis(100);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 const DEFAULT_TTL: Duration = Duration::from_millis(3000);
 const DEFAULT_EXTEND: Duration = Duration::from_millis(1000);
 

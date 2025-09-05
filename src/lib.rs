@@ -94,7 +94,7 @@
 //!         .ttl(Duration::from_secs(3))
 //!         // Set lock auto-extend interval
 //!         // Default: 1s
-//!         // Recommend: lifetime/3
+//!         // Recommend: ttl/3
 //!         .extend(Duration::from_secs(1));
 //!
 //!     // Acquire lock with the custom options
@@ -109,7 +109,7 @@
 //! ## Important Notes
 //!
 //! 1. Don't ignore the return value of acquire method, or the lock will release immediately
-//! 2. If the extend_interval is too large, the lock extension may fail because the lock has been passively released (by expiration) before the extension attempt
+//! 2. If the extension interval is too large, the lock extension may fail because the lock has been passively released (by expiration) before the extension attempt, the recommend is ttl/3
 //! 3. Lock implements Drop trait and will auto-release when out of scope
 //!
 //!
