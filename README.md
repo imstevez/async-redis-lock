@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
 ### Advanced Configuration
 
 ```rust
+use async_redis_lock::Locker;
 use async_redis_lock::options::Options;
 use std::time::Duration;
 
@@ -94,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
     // Acquire lock with the custom options
     let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
 
-    // Do something with lock guard
+    // Perform operations that require locking
+    // ...
+    
+    Ok(())
 }
 ```
 

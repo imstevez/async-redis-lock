@@ -69,6 +69,7 @@
 //! ### Advanced Configuration
 //!
 //! ```rust
+//! use async_redis_lock::Locker;
 //! use async_redis_lock::options::Options;
 //! use std::time::Duration;
 //!
@@ -94,6 +95,8 @@
 //!
 //!     // Perform operations that require locking
 //!     // ...
+//!
+//!     Ok(())
 //! }
 //! ```
 //! ## Important Notes
@@ -318,12 +321,12 @@ mod test {
         let r = locker.acquire_with_options(&opts, &lock_key).await;
         assert!(
             r.is_ok(),
-            "Should acquire a lock with customized lifetime and extend_interval, extend_interval smaller than lifetime."
+            "Should acquire a lock with customized lifetime and extend_interval, extend_interval smaller than lifetime"
         );
 
         sleep(Duration::from_secs(5)).await;
         match locker.acquire(&lock_key).await.err() {
-            None => assert!(false, "Should expand lock lifetime automatically."),
+            None => assert!(false, "Should extend lock lifetime automatically"),
             Some(e) => {
                 assert_eq!(e.downcast_ref::<Error>().unwrap(), &Error::Timeout)
             }
