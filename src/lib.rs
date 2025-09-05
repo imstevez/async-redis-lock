@@ -121,7 +121,6 @@ use crate::error::Error;
 use crate::error::Error::IdNotFound;
 use crate::execs::*;
 use crate::options::Options;
-use std::time::SystemTime;
 
 use anyhow::Result;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -161,14 +160,6 @@ impl Locker {
         )
         .await?;
 
-        println!(
-            "lock: {}",
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        );
-
         let mut conn = self.conn_manager.clone();
         let opts = opts.clone();
         let lock_key_c1 = lock_key.to_owned();
@@ -180,7 +171,6 @@ impl Locker {
                 select! {
                     _ = &mut stop_rx => break,
                     _ = sleep(opts.extend) => {
-                        println!("extend: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
                         if let Err(e) = extend(
                             &mut conn,
                             &lock_key_c1,
@@ -190,22 +180,13 @@ impl Locker {
                         .await
                         {
                             if let Some(e) = e.downcast_ref::<Error>() && matches!(e, IdNotFound) {
-                                println!("extend failed: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
                                 break;
                             }
                         } else {
-                            println!("extend ok: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
                         }
                     },
                 }
             }
-            println!(
-                "extend exit: {}",
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            );
         });
 
         let cli = self.client.clone();
@@ -349,7 +330,7 @@ mod test {
             "Should acquire a lock with customized lifetime and extend_interval, extend_interval smaller than lifetime"
         );
 
-        sleep(Duration::from_secs(8)).await;
+        sleep(Duration::from_secs(5)).await;
         match locker.acquire(&lock_key).await.err() {
             None => assert!(false, "Should extend lock lifetime automatically"),
             Some(e) => {
