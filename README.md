@@ -81,21 +81,25 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
-
+    
     // Build a custom lock options
     let opts = Options::new()
-        // Set auto-extend interval (default: 1s)
-        // Must be shorter than lifetime to prevent unintended lock release
-        .extend_interval(Duration::from_secs(3))
-        // Set retry interval between acquisition attempts (default: 500ms)
-        .retry_interval(Duration::from_secs(1))
-        // Set maximum time to attempt acquisition (default: 1s)
-        // None means retry indefinitely
-        .retry_timeout(Some(Duration::from_secs(3)))
-        // Set maximum duration before auto-release (default: 2s)
-        .lifetime(Duration::from_secs(5));
-
-    // Acquire lock with the custom options
+        // Set interval between acquisition attempts
+        // Default: 100ms
+        .retry(Duration::from_millis(100))
+        // Set maximum time to attempt acquisition
+        // Default: Some(1s)
+        // Note: none means retry indefinitely
+        .timeout(Some(Duration::from_secs(1)))
+        // Set lock time-to-live before auto-release
+        // Default: 3s
+        .ttl(Duration::from_secs(3))
+        // Set lock auto-extend interval
+        // Default: 1s
+        // Recommend: lifetime/3
+        .extend(Duration::from_secs(1));
+    
+     // Acquire lock with the custom options
     let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
 
     // Perform operations that require locking

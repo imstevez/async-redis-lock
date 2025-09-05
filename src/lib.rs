@@ -82,16 +82,20 @@
 //!
 //!     // Build a custom lock options
 //!     let opts = Options::new()
-//!         // Set auto-extend interval (default: 1s)
-//!         // Must be shorter than lifetime to prevent unintended lock release
-//!         .extend_interval(Duration::from_secs(3))
-//!         // Set retry interval between acquisition attempts (default: 500ms)
-//!         .retry_interval(Duration::from_secs(1))
-//!         // Set maximum time to attempt acquisition (default: 1s)
-//!         // None means retry indefinitely
-//!         .retry_timeout(Some(Duration::from_secs(3)))
-//!         // Set maximum duration before auto-release (default: 2s)
-//!         .lifetime(Duration::from_secs(5));
+//!         // Set interval between acquisition attempts
+//!         // Default: 100ms
+//!         .retry(Duration::from_millis(100))
+//!         // Set maximum time to attempt acquisition
+//!         // Default: Some(1s)
+//!         // Note: none means retry indefinitely
+//!         .timeout(Some(Duration::from_secs(1)))
+//!         // Set lock time-to-live before auto-release
+//!         // Default: 3s
+//!         .ttl(Duration::from_secs(3))
+//!         // Set lock auto-extend interval
+//!         // Default: 1s
+//!         // Recommend: lifetime/3
+//!         .extend(Duration::from_secs(1));
 //!
 //!     // Acquire lock with the custom options
 //!     let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
@@ -105,7 +109,7 @@
 //! ## Important Notes
 //!
 //! 1. Don't ignore the return value of acquire method, or the lock will release immediately
-//! 2. extend_interval must be less than lifetime to prevent unintended release
+//! 2. If the extend_interval is too large, the lock extension may fail because the lock has been passively released (by expiration) before the extension attempt
 //! 3. Lock implements Drop trait and will auto-release when out of scope
 //!
 //!
@@ -117,6 +121,7 @@ use crate::error::Error;
 use crate::error::Error::IdNotFound;
 use crate::execs::*;
 use crate::options::Options;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -150,11 +155,19 @@ impl Locker {
         let lock_id = lock(
             &mut self.conn_manager,
             lock_key,
-            opts.lifetime,
-            opts.retry_interval,
-            opts.retry_timeout,
+            opts.ttl,
+            opts.retry,
+            opts.timeout,
         )
         .await?;
+
+        println!(
+            "lock: {}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
 
         let mut conn = self.conn_manager.clone();
         let opts = opts.clone();
@@ -166,24 +179,33 @@ impl Locker {
             loop {
                 select! {
                     _ = &mut stop_rx => break,
-                    _ = sleep(opts.extend_interval) => {
+                    _ = sleep(opts.extend) => {
+                        println!("extend: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
                         if let Err(e) = extend(
                             &mut conn,
                             &lock_key_c1,
                             &lock_id_c1,
-                            opts.lifetime,
+                            opts.ttl,
                         )
                         .await
                         {
-                            if let Some(e) = e.downcast_ref::<Error>() {
-                                if matches!(e, IdNotFound) {
-                                    break;
-                                }
+                            if let Some(e) = e.downcast_ref::<Error>() && matches!(e, IdNotFound) {
+                                println!("extend failed: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
+                                break;
                             }
+                        } else {
+                            println!("extend ok: {}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs());
                         }
                     },
                 }
             }
+            println!(
+                "extend exit: {}",
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            );
         });
 
         let cli = self.client.clone();
@@ -297,8 +319,8 @@ mod test {
         let lock_key = "test:test_lock_passive_release_key";
 
         let opts = Options::new()
-            .lifetime(Duration::from_secs(2))
-            .extend_interval(Duration::from_secs(3));
+            .ttl(Duration::from_secs(2))
+            .extend(Duration::from_secs(3));
         let r = locker.acquire_with_options(&opts, &lock_key).await;
         assert!(
             r.is_ok(),
@@ -319,15 +341,15 @@ mod test {
             .unwrap();
         let lock_key = "test:test_lock_extend_key";
         let opts = Options::new()
-            .lifetime(Duration::from_secs(3))
-            .extend_interval(Duration::from_secs(2));
+            .ttl(Duration::from_secs(3))
+            .extend(Duration::from_secs(1));
         let r = locker.acquire_with_options(&opts, &lock_key).await;
         assert!(
             r.is_ok(),
             "Should acquire a lock with customized lifetime and extend_interval, extend_interval smaller than lifetime"
         );
 
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(8)).await;
         match locker.acquire(&lock_key).await.err() {
             None => assert!(false, "Should extend lock lifetime automatically"),
             Some(e) => {
