@@ -182,7 +182,6 @@ impl Locker {
                             if let Some(e) = e.downcast_ref::<Error>() && matches!(e, IdNotFound) {
                                 break;
                             }
-                        } else {
                         }
                     },
                 }
