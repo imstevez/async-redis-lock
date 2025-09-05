@@ -1,3 +1,6 @@
+//! [![Crates.io](https://img.shields.io/crates/v/async-redis-lock)](https://crates.io/crates/redis-lock)
+//! [![docs](https://img.shields.io/crates/v/async-redis-lock?color=yellow&label=docs)](https://docs.rs/redis-lock)
+//!
 //! A simple and easy-to-use asynchronous redis distributed lock implementation based on tokio and redis-rs.
 //!
 //! ## Key Features
