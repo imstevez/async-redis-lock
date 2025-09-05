@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-const DEFAULT_DURATION: Duration = Duration::from_millis(3000);
+const DEFAULT_DURATION: Duration = Duration::from_millis(2000);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_RETRY_TIMEOUT: Duration = Duration::from_millis(1000);
-const DEFAULT_EXTEND_INTERVAL: Duration = Duration::from_millis(2000);
+const DEFAULT_EXTEND_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {

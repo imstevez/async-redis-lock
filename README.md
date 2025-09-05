@@ -1,62 +1,111 @@
 # async-redis-lock
 
-A simple and easy-to-use asynchronous redis distributed read-write lock implementation based on tokio and redis-rs.
+A simple and easy-to-use asynchronous redis distributed lock implementation based on tokio and redis-rs.
 
-## Features:
+## Key Features
 
-1. Automatic extension: When a lock is acquired, the lifetime of the lock will be automatically extended in background
-   until the lock is released.
-2. Passive release: When progress exit abnormally, the lock will be automatically released the lifetime is exhausted.
-3. Drop support: Lock can be released implicitly by drop as well as explicitly by call release method.
+- ✨ **Auto Extension** - Automatically extends lock lifetime in background until released
+- 🔒 **Passive Release** - Lock automatically releases when lifetime expires after process crash
+- 🎯 **Drop Support** - Supports both implicit release via drop and explicit release via method call
 
-## Examples
+## Quick Start
 
-### 1. General usage
+### Installation
+
+```toml
+[dependencies]
+async-redis-lock = "0.0.1"
+```
+
+### Basic Usage
 
 ```rust
 use async_redis_lock::Locker;
-use async_redis_lock::options::Options;
-use std::time::Duration;
-use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Create locker from the redis url.
+    // Create locker
     let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
 
-    // Lock key.
-    let lock_key = "lock_key";
+    // Acquire lock
+    let lock = locker.acquire("lock_key").await?;
 
-    // Acquire a lock.
-    let lock = locker.acquire(lock_key).await?;
-
-    // Do something.
-    sleep(Duration::from_secs(5)).await;
-
-    // Release the lock explicitly.
+    // At this point:
+    // 1. Lock is held
+    // 2. Background task automatically extends lock TTL
+    // 3. Safe to perform critical operations
+    // ...    
+    
+    // Release lock explicitly
+    // Alternative: drop(lock) for implicit release
     lock.release()?;
-
-    // Acquire another lock in a scope.
-    {
-        // the type of _lock has implemented Drop trait, so the _lock will be automatically released when _lock goes out the scope.
-        // Note: Do not ignore the returned value of the acquire method, otherwise the lock will be released immediately.
-        let _lock = locker.acquire(lock_key).await?;
-    }
-
-    // Acquire lock with custom options.
-    let opts = Options::new()
-        // Set the wait time for passively released the lock when the process exits abnormally.
-        .lifetime(Duration::from_secs(5))
-        // Set the retry interval when the lock acquisition fails due to reasons such as existing other locks.
-        .retry_interval(Duration::from_secs(1))
-        // Set the retry timeout, if the value is None, retry util the lock acquisition success.
-        .retry_timeout(Some(Duration::from_secs(3)))
-        // Set the interval for automatically extend the lock lifetime.
-        // This value should always be less than lifetime,
-        // otherwise the lock will be passively released when extend the lifetime.
-        .extend_interval(Duration::from_secs(3));
-    locker.acquire_with_options(&opts, lock_key).await?;
 
     Ok(())
 }
 ```
+
+### Automatic Release
+
+```rust
+use async_redis_lock::Locker;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
+
+    // Use block scope to control lock lifetime
+    {
+        // Acquire lock and store in _lock variable
+        // The _ prefix indicates we only care about its Drop behavior
+        let _lock = locker.acquire("lock_key").await?;
+        // Perform operations that require locking
+        // ...
+        // Lock will be automatically released when block ends
+        // Thanks to Rust's Drop trait implementation
+    }
+
+    Ok(())
+}
+```
+
+### Advanced Configuration
+
+```rust
+use async_redis_lock::options::Options;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
+
+    // Build a custom lock options
+    let opts = Options::new()
+        // Set auto-extend interval (default: 1s)
+        // Must be shorter than lifetime to prevent unintended lock release
+        .extend_interval(Duration::from_secs(3))
+        // Set retry interval between acquisition attempts (default: 500ms)
+        .retry_interval(Duration::from_secs(1))
+        // Set maximum time to attempt acquisition (default: 1s)
+        // None means retry indefinitely
+        .retry_timeout(Some(Duration::from_secs(3)))
+        // Set maximum duration before auto-release (default: 2s)
+        .lifetime(Duration::from_secs(5));
+
+    // Acquire lock with the custom options
+    let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
+
+    // Do something with lock guard
+}
+```
+
+## Important Notes
+
+1. Don't ignore the return value of acquire method, or the lock will release immediately
+2. extend_interval must be less than lifetime to prevent unintended release
+3. Lock implements Drop trait and will auto-release when out of scope
+
+## License
+
+MIT
+
+Contributions and suggestions are welcome!
