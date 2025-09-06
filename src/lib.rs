@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! async-redis-lock = "0.0.7"
+//! async-redis-lock = "0.1.0"
 //! ```
 //!
 //! ### Basic Usage
