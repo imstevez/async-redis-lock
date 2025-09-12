@@ -10,6 +10,7 @@ A simple and easy-to-use asynchronous redis distributed lock implementation base
 - ✨ **Auto Extension** - Automatically extends lock lifetime in background until released
 - 🔒 **Passive Release** - Lock automatically releases when lifetime expires after process crash
 - 🎯 **Drop Support** - Supports both implicit release via drop and explicit release via method call
+- 🔗 **Multi-key Locking** - Ability to lock multiple keys simultaneously ensuring atomic operations across them
 
 ## Quick Start
 
@@ -17,7 +18,7 @@ A simple and easy-to-use asynchronous redis distributed lock implementation base
 
 ```toml
 [dependencies]
-async-redis-lock = "0.1.0"
+async-redis-lock = "0.2.0"
 ```
 
 ### Basic Usage
@@ -31,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0").await?;
 
     // Acquire lock
-    let lock = locker.acquire("lock_key").await?;
+    let lock = locker.acquire("lock_key_1", "lock_key_2").await?;
 
     // At this point:
     // 1. Lock is held
@@ -60,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     {
         // Acquire lock and store in _lock variable
         // The _ prefix indicates we only care about its Drop behavior
-        let _lock = locker.acquire("lock_key").await?;
+        let _lock = locker.acquire("lock_key_1, lock_key_2").await?;
         // Perform operations that require locking
         // ...
         // Lock will be automatically released when block ends
@@ -100,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         .extend(Duration::from_secs(1));
 
     // Acquire lock with the custom options
-    let _lock = locker.acquire_with_options(&opts, "lock_key").await?;
+    let _lock = locker.acquire_with_options(&opts, "lock_key_1", "lock_key_2").await?;
 
     // Perform operations that require locking
     // ...

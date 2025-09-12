@@ -8,6 +8,7 @@
 //! - ✨ **Auto Extension** - Automatically extends lock lifetime in background until released
 //! - 🔒 **Passive Release** - Lock automatically releases when lifetime expires after process crash
 //! - 🎯 **Drop Support** - Supports both implicit release via drop and explicit release via method call
+//! - 🔗 **Multi-key Locking** - Ability to lock multiple keys simultaneously ensuring atomic operations across them
 //!
 //! ## Quick Start
 //!
@@ -15,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! async-redis-lock = "0.1.0"
+//! async-redis-lock = "0.2.0"
 //! ```
 //!
 //! ### Basic Usage
@@ -123,6 +124,7 @@ use crate::execs::*;
 use crate::options::Options;
 
 use anyhow::Result;
+use redis::ToRedisArgs;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -145,15 +147,30 @@ impl Locker {
         })
     }
 
-    pub async fn acquire(&mut self, lock_key: &str) -> Result<Lock> {
-        self.acquire_with_options(&Options::default(), lock_key)
+    /// Acquires a lock for the given key(s).
+    ///
+    /// # Arguments
+    /// * `lock_keys` - A single key or a collection of keys to be locked.
+    pub async fn acquire<K>(&mut self, lock_keys: &K) -> Result<Lock>
+    where
+        K: ToRedisArgs + Clone + Send + 'static,
+    {
+        self.acquire_with_options(&Options::default(), lock_keys)
             .await
     }
 
-    pub async fn acquire_with_options(&mut self, opts: &Options, lock_key: &str) -> Result<Lock> {
+    /// Acquires a lock for the given key(s) with custom options.
+    ///
+    /// # Arguments
+    /// * `opts` - Options for lock acquisition and management.
+    /// * `lock_keys` - A single key or a collection of keys to be locked.
+    pub async fn acquire_with_options<K>(&mut self, opts: &Options, lock_keys: &K) -> Result<Lock>
+    where
+        K: ToRedisArgs + Clone + Send + 'static,
+    {
         let lock_id = lock(
             &mut self.conn_manager,
-            lock_key,
+            lock_keys,
             opts.ttl,
             opts.retry,
             opts.timeout,
@@ -162,19 +179,20 @@ impl Locker {
 
         let mut conn = self.conn_manager.clone();
         let opts = opts.clone();
-        let lock_key_c1 = lock_key.to_owned();
-        let lock_id_c1 = lock_id.clone();
+        let lock_keys_copy = lock_keys.clone();
+        let lock_id_copy = lock_id.clone();
         let (stop_tx, mut stop_rx) = oneshot::channel();
 
         spawn(async move {
             loop {
+                let lock_keys = lock_keys_copy.clone();
                 select! {
                     _ = &mut stop_rx => break,
                     _ = sleep(opts.extend) => {
                         if let Err(e) = extend(
                             &mut conn,
-                            &lock_key_c1,
-                            &lock_id_c1,
+                            lock_keys,
+                            &lock_id_copy,
                             opts.ttl,
                         )
                         .await
@@ -189,14 +207,12 @@ impl Locker {
         });
 
         let cli = self.client.clone();
-        let lock_key_c2 = lock_key.to_owned();
-        let lock_id_c2 = lock_id.clone();
-
+        let lock_keys_copy = lock_keys.clone();
         Ok(Lock {
             release_fn: Some(Box::new(move || -> Result<()> {
                 let _ = stop_tx.send(());
                 let mut conn = cli.get_connection()?;
-                unlock_sync(&mut conn, &lock_key_c2, &lock_id_c2)
+                unlock_sync(&mut conn, lock_keys_copy, &lock_id)
             })),
         })
     }
@@ -235,12 +251,16 @@ mod test {
         let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0")
             .await
             .unwrap();
-        let lock_key = String::from("test:test_lock_exclusive_key");
 
-        let r = locker.acquire(&lock_key).await;
+        let lock_keys = vec![
+            "test:test_lock_exclusive_key_1",
+            "test:test_lock_exclusive_key_2",
+        ];
+
+        let r = locker.acquire(&lock_keys).await;
         assert!(r.is_ok(), "Should acquire a lock");
 
-        match locker.acquire(&lock_key).await.err() {
+        match locker.acquire(&lock_keys).await.err() {
             None => assert!(false, "Should get an error when acquiring another lock"),
             Some(e) => {
                 assert_eq!(
@@ -254,7 +274,7 @@ mod test {
         assert!(r.unwrap().release().is_ok(), "Should release a lock");
 
         assert!(
-            locker.acquire(&lock_key).await.is_ok(),
+            locker.acquire(&lock_keys).await.is_ok(),
             "Should acquire a lock after another lock is released"
         );
     }
@@ -264,13 +284,14 @@ mod test {
         let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0")
             .await
             .unwrap();
-        let lock_key = "test:test_lock_drop_key";
+
+        let lock_keys = vec!["test:test_lock_drop_key_1", "test:test_lock_drop_key_2"];
 
         {
-            let r = locker.acquire(&lock_key).await;
+            let r = locker.acquire(&lock_keys).await;
             assert!(r.is_ok(), "Should acquire a lock in a scope");
 
-            match locker.acquire(&lock_key).await.err() {
+            match locker.acquire(&lock_keys).await.err() {
                 None => assert!(
                     false,
                     "Should get an error when acquiring another lock in a scope"
@@ -286,7 +307,7 @@ mod test {
         }
 
         assert!(
-            locker.acquire(&lock_key).await.is_ok(),
+            locker.acquire(&lock_keys).await.is_ok(),
             "Should acquire a lock out of the prev scope"
         );
     }
@@ -296,20 +317,24 @@ mod test {
         let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0")
             .await
             .unwrap();
-        let lock_key = "test:test_lock_passive_release_key";
+
+        let lock_keys = vec![
+            "test:test_lock_passive_release_key_1",
+            "test:test_lock_passive_release_key_2",
+        ];
 
         let opts = Options::new()
             .ttl(Duration::from_secs(2))
             .extend(Duration::from_secs(3));
-        let r = locker.acquire_with_options(&opts, &lock_key).await;
+        let r = locker.acquire_with_options(&opts, &lock_keys).await;
         assert!(
             r.is_ok(),
             "Should acquire a lock with customized lifetime and extend_interval, extend_interval greater than lifetime"
         );
 
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(10)).await;
         assert!(
-            locker.acquire(&lock_key).await.is_ok(),
+            locker.acquire(&lock_keys).await.is_ok(),
             "Should passively release a lock when the lifetime is reached"
         );
     }
@@ -319,18 +344,19 @@ mod test {
         let mut locker = Locker::from_redis_url("redis://127.0.0.1:6379/0")
             .await
             .unwrap();
-        let lock_key = "test:test_lock_extend_key";
+        let lock_keys = vec!["test:test_lock_extend_key_1", "test:test_lock_extend_key_2"];
+
         let opts = Options::new()
             .ttl(Duration::from_secs(3))
             .extend(Duration::from_secs(1));
-        let r = locker.acquire_with_options(&opts, &lock_key).await;
+        let r = locker.acquire_with_options(&opts, &lock_keys).await;
         assert!(
             r.is_ok(),
             "Should acquire a lock with customized lifetime and extend_interval, extend_interval smaller than lifetime"
         );
 
         sleep(Duration::from_secs(5)).await;
-        match locker.acquire(&lock_key).await.err() {
+        match locker.acquire(&lock_keys).await.err() {
             None => assert!(false, "Should extend lock lifetime automatically"),
             Some(e) => {
                 assert_eq!(e.downcast_ref::<Error>().unwrap(), &Error::Timeout)
