@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! async-redis-lock = "0.2.0"
+//! async-redis-lock = "0.2.1"
 //! ```
 //!
 //! ### Basic Usage
@@ -219,7 +219,7 @@ impl Locker {
 }
 
 pub struct Lock {
-    pub release_fn: Option<Box<dyn FnOnce() -> Result<()> + Send + 'static>>,
+    release_fn: Option<Box<dyn FnOnce() -> Result<()> + Send + 'static>>,
 }
 
 impl Lock {
