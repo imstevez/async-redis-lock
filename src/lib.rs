@@ -197,7 +197,7 @@ impl Locker {
                         )
                         .await
                         {
-                            if let Some(e) = e.downcast_ref::<Error>() && matches!(e, IdNotFound) {
+                            if let Some(IdNotFound) = e.downcast_ref::<Error>() {
                                 break;
                             }
                         }
