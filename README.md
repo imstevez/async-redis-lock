@@ -18,7 +18,7 @@ A simple and easy-to-use asynchronous redis distributed lock implementation base
 
 ```toml
 [dependencies]
-async-redis-lock = "0.2.1"
+async-redis-lock = "0.2.3"
 ```
 
 ### Basic Usage
