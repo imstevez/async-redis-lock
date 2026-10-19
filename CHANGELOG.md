@@ -2,6 +2,45 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.4.0 - 2026-10-19
+
+### Breaking changes
+
+- `Options` gained the public `operation_timeout` field (default 1s). Code that
+  builds `Options` with a struct literal must set it or use
+  `..Options::default()`.
+
+### Added
+
+- `Options::operation_timeout` (default 1s) bounds auto-extension and release
+  commands, so a Redis outage cannot hold a maintenance command for the
+  connection manager's full reconnect/retry window. The effective bound is
+  `min(operation_timeout, ttl)`.
+- `Error::OperationTimeout` for an extension or release command that exceeds
+  that bound.
+
+### Changed
+
+- Lua scripts are now built once with `LazyLock<Script>` instead of being
+  rebuilt, and SHA1-hashed, on every acquire, extend or release.
+
+### Fixed
+
+- Duplicate keys passed to `acquire` are deduplicated, so `release()` no longer
+  reports `IdNotFound` after successfully deleting the key.
+- If `release()` fails with a Redis error, the guard now keeps its state so
+  `Drop` can make one best-effort retry instead of leaving the key to expire.
+- Acquisition timeouts use `Instant::checked_add`, so an oversized timeout no
+  longer panics.
+- CI now validates the declared MSRV (Rust 1.89) in a dedicated job.
+
+### Documentation
+
+- Documented duplicate-key handling and the cleanup semantics of a failed
+  `release()`.
+- Documented bounded extension/release commands and their interaction with the
+  lock TTL.
+
 ## 0.3.0 - 2026-10-19
 
 ### Breaking changes

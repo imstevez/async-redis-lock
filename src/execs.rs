@@ -1,9 +1,11 @@
+use std::future::Future;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use redis::ConnectionLike as SyncConnectionLike;
 use redis::Script;
 use redis::aio::ConnectionLike as AsyncConnectionLike;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::error::{Error, Result};
 
@@ -47,6 +49,12 @@ end
 return deleted
 "#;
 
+// `Script::new` computes the SHA1 of the Lua source. Build each script once
+// and share it: `Script` is immutable and `prepare_invoke` only borrows it.
+static LOCK_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(LOCK));
+static EXTEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(EXTEND));
+static UNLOCK_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(UNLOCK));
+
 fn ttl_millis(ttl: Duration) -> Result<u64> {
     let millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
     if millis == 0 {
@@ -63,6 +71,22 @@ fn check_unlocked(deleted: i64, expected: usize) -> Result<()> {
     }
 }
 
+/// Runs a Redis command with a hard upper bound on how long it may take.
+///
+/// `ConnectionManager` may wait for several reconnect attempts before a command
+/// fails, which can be much longer than the lock TTL. Timing out here keeps
+/// extension and release bounded; Redis may still apply the command, but the
+/// owner-token check makes a retry safe.
+async fn with_timeout<F, T>(duration: Duration, future: F) -> Result<T>
+where
+    F: Future<Output = redis::RedisResult<T>>,
+{
+    match timeout(duration, future).await {
+        Ok(result) => result.map_err(Error::from),
+        Err(_) => Err(Error::OperationTimeout),
+    }
+}
+
 pub(crate) async fn lock<C: AsyncConnectionLike>(
     conn: &mut C,
     keys: &[Vec<u8>],
@@ -73,15 +97,16 @@ pub(crate) async fn lock<C: AsyncConnectionLike>(
     let ttl_ms = ttl_millis(ttl)?;
     let lock_id = uuid::Uuid::new_v4().to_string();
 
-    let script = Script::new(LOCK);
-    let mut invoke = script.prepare_invoke();
+    let mut invoke = LOCK_SCRIPT.prepare_invoke();
     for key in keys {
         invoke.key(key);
     }
     invoke.arg(&lock_id);
     invoke.arg(ttl_ms);
 
-    let deadline = retry_timeout.map(|timeout| Instant::now() + timeout);
+    // An unrepresentable timeout (for example `Duration::MAX`) is treated as
+    // "no timeout" instead of panicking while adding it to `Instant::now()`.
+    let deadline = retry_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
 
     loop {
         let acquired: i32 = invoke.invoke_async(conn).await?;
@@ -109,18 +134,18 @@ pub(crate) async fn extend<C: AsyncConnectionLike>(
     keys: &[Vec<u8>],
     lock_id: &str,
     ttl: Duration,
+    operation_timeout: Duration,
 ) -> Result<()> {
     let ttl_ms = ttl_millis(ttl)?;
 
-    let script = Script::new(EXTEND);
-    let mut invoke = script.prepare_invoke();
+    let mut invoke = EXTEND_SCRIPT.prepare_invoke();
     for key in keys {
         invoke.key(key);
     }
     invoke.arg(lock_id);
     invoke.arg(ttl_ms);
 
-    let extended: i32 = invoke.invoke_async(conn).await?;
+    let extended: i32 = with_timeout(operation_timeout, invoke.invoke_async(conn)).await?;
     if extended == OK_RET {
         Ok(())
     } else {
@@ -132,15 +157,15 @@ pub(crate) async fn unlock<C: AsyncConnectionLike>(
     conn: &mut C,
     keys: &[Vec<u8>],
     lock_id: &str,
+    operation_timeout: Duration,
 ) -> Result<()> {
-    let script = Script::new(UNLOCK);
-    let mut invoke = script.prepare_invoke();
+    let mut invoke = UNLOCK_SCRIPT.prepare_invoke();
     for key in keys {
         invoke.key(key);
     }
     invoke.arg(lock_id);
 
-    let deleted: i64 = invoke.invoke_async(conn).await?;
+    let deleted: i64 = with_timeout(operation_timeout, invoke.invoke_async(conn)).await?;
     check_unlocked(deleted, keys.len())
 }
 
@@ -149,8 +174,7 @@ pub(crate) fn unlock_sync<C: SyncConnectionLike>(
     keys: &[Vec<u8>],
     lock_id: &str,
 ) -> Result<()> {
-    let script = Script::new(UNLOCK);
-    let mut invoke = script.prepare_invoke();
+    let mut invoke = UNLOCK_SCRIPT.prepare_invoke();
     for key in keys {
         invoke.key(key);
     }
@@ -158,4 +182,21 @@ pub(crate) fn unlock_sync<C: SyncConnectionLike>(
 
     let deleted: i64 = invoke.invoke(conn)?;
     check_unlocked(deleted, keys.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn operation_timeout_maps_to_error() {
+        let result = with_timeout(
+            Duration::from_millis(1),
+            pending::<redis::RedisResult<()>>(),
+        )
+        .await;
+        assert_eq!(result, Err(Error::OperationTimeout));
+    }
 }

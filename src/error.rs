@@ -20,6 +20,14 @@ pub enum Error {
     #[error("timed out while acquiring the lock")]
     Timeout,
 
+    /// A Redis extension or release command did not finish within the
+    /// configured [`Options::operation_timeout`](crate::Options::operation_timeout).
+    ///
+    /// The command may still have been applied by Redis. The owner-token check
+    /// makes retries safe, and the TTL is the final fallback.
+    #[error("redis operation timed out")]
+    OperationTimeout,
+
     /// No keys were provided to [`Locker::acquire`](crate::Locker::acquire).
     #[error("at least one lock key is required")]
     NoKeys,

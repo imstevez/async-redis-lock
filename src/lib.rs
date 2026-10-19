@@ -10,6 +10,7 @@ pub mod options;
 pub use crate::error::{Error, Result};
 pub use crate::options::Options;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,7 +99,8 @@ impl Locker {
     /// Acquires a lock for one or more keys with custom [`Options`].
     ///
     /// The lock is acquired atomically: for a multi-key lock either all keys
-    /// are acquired or none of them are acquired.
+    /// are acquired or none of them are acquired. Duplicate keys are ignored,
+    /// so `["a", "a"]` behaves like `["a"]`.
     ///
     /// # Errors
     ///
@@ -113,16 +115,23 @@ impl Locker {
     ) -> Result<Lock> {
         opts.validate()?;
 
-        let keys = lock_keys.to_redis_args();
+        let mut keys = lock_keys.to_redis_args();
         if keys.is_empty() {
             return Err(Error::NoKeys);
         }
+
+        // Several keys are set in one atomic script, so the same key repeated
+        // in the list would be deleted only once by UNLOCK and make `release`
+        // report `IdNotFound` even though the lock was released successfully.
+        let mut seen = HashSet::with_capacity(keys.len());
+        keys.retain(|key| seen.insert(key.clone()));
 
         let mut conn = self.conn_manager.clone();
         let lock_id = lock(&mut conn, &keys, opts.ttl, opts.retry, opts.timeout).await?;
 
         let (cancel, cancel_rx) = oneshot::channel();
         let lost = Arc::new(AtomicBool::new(false));
+        let operation_timeout = opts.effective_operation_timeout();
 
         tokio::spawn(extend_lock(
             conn,
@@ -138,7 +147,8 @@ impl Locker {
                 conn: self.conn_manager.clone(),
                 keys,
                 lock_id,
-                cancel,
+                cancel: Some(cancel),
+                operation_timeout,
             }),
             client: self.client.clone(),
             lost,
@@ -156,12 +166,13 @@ async fn extend_lock(
     lost: Arc<AtomicBool>,
 ) {
     let mut last_success = Instant::now();
+    let operation_timeout = opts.effective_operation_timeout();
 
     loop {
         tokio::select! {
             _ = &mut cancel => break,
             _ = sleep(opts.extend) => {
-                match extend(&mut conn, &keys, &lock_id, opts.ttl).await {
+                match extend(&mut conn, &keys, &lock_id, opts.ttl, operation_timeout).await {
                     Ok(()) => last_success = Instant::now(),
                     Err(Error::IdNotFound) => {
                         // Another owner took the lock (or it expired).
@@ -196,37 +207,58 @@ struct LockInner {
     conn: ConnectionManager,
     keys: Vec<Vec<u8>>,
     lock_id: String,
-    cancel: oneshot::Sender<()>,
+    cancel: Option<oneshot::Sender<()>>,
+    operation_timeout: Duration,
 }
 
 impl Lock {
     /// Releases the lock and waits for Redis to confirm it.
     ///
-    /// This consumes the `Lock`, so the [`Drop`] implementation becomes a
-    /// no-op afterwards.
+    /// This consumes the `Lock`. If the unlock command fails with
+    /// [`Error::Redis`] or [`Error::OperationTimeout`], the error is propagated
+    /// and the consumed guard schedules one best-effort retry when it is
+    /// dropped. If that retry also fails, the lock expires after its TTL.
     ///
     /// # Errors
     ///
     /// Returns [`Error::IdNotFound`] when the lock had already expired or at
     /// least one key was no longer owned by this lock. Keys still owned by this
     /// lock are deleted in that case.
+    ///
+    /// Returns [`Error::Redis`] when the unlock command could not be executed
+    /// or its response could not be read.
+    ///
+    /// Returns [`Error::OperationTimeout`] when the unlock command did not
+    /// finish within the configured
+    /// [`Options::operation_timeout`](crate::Options::operation_timeout).
+    ///
+    /// In both error cases some keys may still exist; `Drop` retries the
+    /// unlock once, and the TTL is the final fallback.
     pub async fn release(mut self) -> Result<()> {
-        let Some(inner) = self.inner.take() else {
+        let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
 
-        let LockInner {
-            mut conn,
-            keys,
-            lock_id,
-            cancel,
-        } = inner;
+        if let Some(cancel) = inner.cancel.take() {
+            let _ = cancel.send(());
+        }
 
-        let _ = cancel.send(());
-        let result = unlock(&mut conn, &keys, &lock_id).await;
+        let result = unlock(
+            &mut inner.conn,
+            &inner.keys,
+            &inner.lock_id,
+            inner.operation_timeout,
+        )
+        .await;
 
-        if matches!(&result, Err(Error::IdNotFound)) {
-            self.lost.store(true, Ordering::SeqCst);
+        match &result {
+            Ok(()) => self.inner = None,
+            Err(Error::IdNotFound) => {
+                self.lost.store(true, Ordering::SeqCst);
+                self.inner = None;
+            }
+            // Keep the guard state so `Drop` can retry a transient failure.
+            Err(_) => {}
         }
 
         result
@@ -273,8 +305,11 @@ impl Drop for Lock {
             keys,
             lock_id,
             cancel,
+            operation_timeout,
         } = inner;
-        let _ = cancel.send(());
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(());
+        }
 
         // `Drop` cannot await. Release in the background when a runtime is
         // available, and fall back to a blocking connection otherwise. If the
@@ -283,7 +318,7 @@ impl Drop for Lock {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let _ = unlock(&mut conn, &keys, &lock_id).await;
+                    let _ = unlock(&mut conn, &keys, &lock_id, operation_timeout).await;
                 });
             }
             Err(_) => {

@@ -20,7 +20,8 @@ dropped.
 - **Drop support** — dropping a `Lock` releases it on a best-effort basis.
 - **Multi-key locking** — several keys are acquired atomically with a single Lua script.
 - **Lost-lock detection** — `Lock::is_lost` reports when extension finds that the lock is gone.
-- **Typed errors** — `Timeout`, `IdNotFound`, `NoKeys`, `InvalidOptions` and Redis errors.
+- **Bounded maintenance** — auto-extension and release commands are capped by `operation_timeout`.
+- **Typed errors** — `Timeout`, `OperationTimeout`, `IdNotFound`, `NoKeys`, `InvalidOptions` and Redis errors.
 
 ## How it works
 
@@ -42,6 +43,8 @@ drop(Lock)      ──► UNLOCK scheduled in the background (best effort)
   stored as the value of every key belonging to that lock.
 - Acquisition, extension and release are each a **single Lua script**, so Redis
   executes the whole check-and-write sequence atomically.
+- The Lua `Script` objects are built once with `LazyLock`, so their SHA1 is
+  computed at first use instead of on every operation.
 - The **TTL is the crash safety net**. While the process is alive, the extension
   task refreshes the TTL; if the process dies, Redis releases the lock when the
   TTL expires.
@@ -52,7 +55,7 @@ drop(Lock)      ──► UNLOCK scheduled in the background (best effort)
 
 ```toml
 [dependencies]
-async-redis-lock = "0.3.0"
+async-redis-lock = "0.4.0"
 ```
 
 Requires Rust 1.89 or newer.
@@ -63,7 +66,7 @@ Requires Rust 1.89 or newer.
 |------|---------|
 | `Locker` | Entry point. Holds a `redis::Client` and a shared connection manager. Cheap to clone and safe to share between tasks. Provides `acquire` and `acquire_with_options`. |
 | `Lock` | The held lock. Provides `release().await` and `is_lost()`, and releases on `Drop`. |
-| `Options` | Acquisition and lifetime tuning: `retry`, `timeout`, `ttl`, `extend`. |
+| `Options` | Acquisition and lifetime tuning: `retry`, `timeout`, `ttl`, `extend`, `operation_timeout`. |
 | `Error` / `Result` | Crate error type and result alias. |
 
 ## Quick start
@@ -91,7 +94,8 @@ async fn main() -> Result<()> {
 ## Multiple keys
 
 All keys of a multi-key lock are acquired atomically: either every key is
-acquired, or none of them is.
+acquired, or none of them is. Duplicate keys are deduplicated, so
+`["lock_key", "lock_key"]` behaves like `["lock_key"]`.
 
 ```rust,no_run
 use async_redis_lock::{Locker, Result};
@@ -159,6 +163,11 @@ background task. Outside a runtime it falls back to a blocking connection. If
 the process dies before either path finishes, the TTL still releases the lock.
 Use `release().await` when the release must be confirmed before continuing.
 
+If `release().await` returns a Redis error or `OperationTimeout`, the error is
+propagated and the consumed guard schedules one best-effort retry when it is
+dropped. If that retry also fails, the key expires after the TTL. There is no
+way to retry the same guard explicitly after `release` has consumed it.
+
 ## Custom options
 
 ```rust,no_run
@@ -177,7 +186,9 @@ async fn main() -> async_redis_lock::Result<()> {
         // Lock TTL. Default: 3s.
         .ttl(Duration::from_secs(3))
         // Extension interval. Default: 1s; `ttl / 3` is recommended.
-        .extend(Duration::from_secs(1));
+        .extend(Duration::from_secs(1))
+        // Maximum time for one extension/release command. Default: 1s.
+        .operation_timeout(Duration::from_secs(1));
 
     let lock = locker.acquire_with_options(&opts, "lock_key").await?;
     // ...
@@ -187,16 +198,39 @@ async fn main() -> async_redis_lock::Result<()> {
 }
 ```
 
-| Field     | Default | Meaning                                              |
-|-----------|---------|------------------------------------------------------|
-| `retry`   | 100ms   | Interval between acquisition attempts                |
-| `timeout` | 1s      | Maximum acquisition time (`None` = retry forever)    |
-| `ttl`     | 3s      | Lock lifetime before Redis releases it automatically |
-| `extend`  | 1s      | Interval between background TTL extensions           |
+| Field               | Default | Meaning                                              |
+|---------------------|---------|------------------------------------------------------|
+| `retry`             | 100ms   | Interval between acquisition attempts                |
+| `timeout`           | 1s      | Maximum acquisition time (`None` = retry forever)    |
+| `ttl`               | 3s      | Lock lifetime before Redis releases it automatically |
+| `extend`            | 1s      | Interval between background TTL extensions           |
+| `operation_timeout` | 1s      | Maximum time for one extension/release command       |
 
 Invalid options are rejected with `Error::InvalidOptions` before contacting
-Redis: `ttl` must be at least 1ms and `retry` / `extend` must be greater than
-zero. An empty key list is rejected with `Error::NoKeys`.
+Redis: `ttl` and `operation_timeout` must be at least 1ms, and `retry` /
+`extend` must be greater than zero. An empty key list is rejected with
+`Error::NoKeys`.
+
+## Bounded Redis operations
+
+`extend` and `release` commands are bounded by `operation_timeout` (default
+1s). The effective bound is `min(operation_timeout, ttl)`, so a Redis outage
+cannot hold a maintenance command for the connection manager's full
+reconnect/retry window. For timely renewal, keep `operation_timeout` at or
+below `extend`.
+
+If an extension attempt times out, it counts as a failed attempt; the lock is
+marked lost after a full TTL of failures. If `release()` times out, it returns
+`Error::OperationTimeout`; the guard's `Drop` retries once, and the TTL remains
+the final fallback.
+
+`operation_timeout` does not bound the initial `LOCK` command used by
+`acquire`; acquisition is governed by the `timeout` and `retry` options
+between attempts.
+
+The blocking fallback used when a `Lock` is dropped outside a tokio runtime is
+not covered by `operation_timeout`; it uses the Redis client's connection
+timeouts.
 
 ## Detecting lost locks
 
@@ -267,6 +301,8 @@ async fn main() -> async_redis_lock::Result<()> {
 | Automatic expiry after a crash | Yes (TTL) |
 | Background TTL extension | Yes |
 | Lost-lock detection | Yes (`is_lost`, polling) |
+| Bounded extension and release commands | Yes (`operation_timeout`) |
+| Best-effort retry after a failed release | Yes (one attempt from `Drop`) |
 | Fencing tokens | No |
 | Reentrancy | No |
 | Fairness / FIFO ordering | No |
@@ -290,6 +326,12 @@ Additional limitations:
    Redis until the TTL expires.
 6. **Dedicated keys.** Lock keys are overwritten with the owner token. Use
    dedicated lock keys and never store application data under them.
+7. **Timed-out maintenance commands.** A timed-out `extend` or `unlock` may
+   still have been applied by Redis. The owner-token check makes retries safe,
+   but `release()` can return `OperationTimeout` before the key is gone.
+8. **Acquisition command latency.** `operation_timeout` bounds extension and
+   release, not the initial `LOCK` command; acquisition is bounded by `timeout`
+   and `retry` between attempts.
 
 ## FAQ
 
@@ -303,10 +345,18 @@ Use `let _lock = ...` or call `release().await` on the returned value.
 The lock had already expired, or (for multi-key locks) at least one key was
 taken over by another owner. Keys still owned by the lock are deleted anyway.
 
+**What happens if `release()` fails with a Redis error or times out?**
+
+The error is returned to the caller. The consumed `Lock` schedules one
+best-effort retry when it is dropped; if that retry also fails, the key expires
+after the TTL. This is why `release().await` should be treated as a cleanup
+attempt, not as a guarantee that the key is gone immediately.
+
 **Why is `is_lost()` still `false` after Redis went down?**
 
 `is_lost` is driven by extension attempts. If the runtime cannot schedule the
-extension task, no check happens. It also requires one full TTL of extension
+extension task, no check happens. Each attempt is bounded by
+`operation_timeout`, but detection still requires one full TTL of extension
 failures before the lock is declared lost.
 
 **Can I pass a `String` directly?**
@@ -354,8 +404,8 @@ REDIS_URL=redis://127.0.0.1:6379/0 cargo test
 
 ## Minimum supported Rust version
 
-Rust 1.89. The MSRV is validated by the CI toolchain and may be raised in a
-minor release when a dependency requires it.
+Rust 1.89. The MSRV is validated by a dedicated CI job using the 1.89 toolchain
+and may be raised in a minor release when a dependency requires it.
 
 ## License
 

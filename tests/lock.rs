@@ -233,6 +233,44 @@ async fn invalid_options_are_rejected() {
             .expect_err("zero extend"),
         Error::InvalidOptions(_)
     ));
+
+    let opts = Options::new().operation_timeout(Duration::ZERO);
+    assert_eq!(
+        locker
+            .acquire_with_options(&opts, key.as_str())
+            .await
+            .expect_err("zero operation timeout"),
+        Error::InvalidOptions("operation timeout must be at least 1ms")
+    );
+}
+
+#[tokio::test]
+async fn operation_timeout_is_configurable() {
+    let locker = locker().await;
+    let key = key("operation-timeout");
+    let opts = Options::new()
+        .ttl(Duration::from_secs(5))
+        .extend(Duration::from_secs(1))
+        .operation_timeout(Duration::from_millis(200));
+
+    let lock = locker
+        .acquire_with_options(&opts, key.as_str())
+        .await
+        .expect("acquire lock");
+    lock.release().await.expect("release lock");
+}
+
+#[tokio::test]
+async fn huge_acquisition_timeout_does_not_panic() {
+    let locker = locker().await;
+    let key = key("huge-timeout");
+    let opts = Options::new().timeout(Some(Duration::MAX));
+
+    let lock = locker
+        .acquire_with_options(&opts, key.as_str())
+        .await
+        .expect("acquire lock with a huge timeout");
+    lock.release().await.expect("release lock");
 }
 
 #[tokio::test]
@@ -284,4 +322,107 @@ async fn concurrent_acquire_is_exclusive() {
         1,
         "the lock must allow only one holder at a time"
     );
+}
+
+#[tokio::test]
+async fn duplicate_keys_are_deduplicated() {
+    let locker = locker().await;
+    let key = key("duplicate-keys");
+    let keys = vec![key.as_str(), key.as_str()];
+
+    let lock = locker
+        .acquire(keys)
+        .await
+        .expect("acquire a lock with duplicate keys");
+    lock.release().await.expect("release duplicate keys");
+
+    let mut conn = redis::Client::open(redis_url())
+        .expect("redis client")
+        .get_connection()
+        .expect("sync connection");
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg(key.as_str())
+        .query(&mut conn)
+        .expect("exists");
+    assert_eq!(exists, 0, "the lock key must be deleted");
+}
+
+#[tokio::test]
+async fn failed_release_is_retried_on_drop() {
+    let locker = locker().await;
+    let key = key("release-retry");
+
+    // Keep the extension task out of the way for the duration of the test.
+    let opts = Options::new()
+        .ttl(Duration::from_secs(30))
+        .extend(Duration::from_secs(60));
+    let lock = locker
+        .acquire_with_options(&opts, key.as_str())
+        .await
+        .expect("acquire lock");
+
+    let mut conn = redis::Client::open(redis_url())
+        .expect("redis client")
+        .get_connection()
+        .expect("sync connection");
+
+    let token: String = redis::cmd("GET")
+        .arg(key.as_str())
+        .query(&mut conn)
+        .expect("read owner token");
+
+    // Turn the key into a list so `UNLOCK`'s GET fails with WRONGTYPE.
+    redis::cmd("DEL")
+        .arg(key.as_str())
+        .query::<()>(&mut conn)
+        .expect("delete key");
+    redis::cmd("LPUSH")
+        .arg(key.as_str())
+        .arg("not-a-string")
+        .query::<()>(&mut conn)
+        .expect("replace key with a list");
+
+    let result = lock.release().await;
+    assert!(
+        matches!(result, Err(Error::Redis(_))),
+        "release must surface the Redis error, got {result:?}"
+    );
+
+    // `release` consumed the guard, but its Drop schedules a best-effort
+    // retry. Restore the key synchronously before yielding so the retry can
+    // succeed, then let the background task run.
+    redis::cmd("DEL")
+        .arg(key.as_str())
+        .query::<()>(&mut conn)
+        .expect("delete list");
+    redis::cmd("SET")
+        .arg(key.as_str())
+        .arg(token)
+        .arg("PX")
+        .arg(30_000)
+        .query::<()>(&mut conn)
+        .expect("restore owner token");
+
+    // Let the background cleanup task run, polling to keep the test reliable
+    // on a loaded CI runner.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut exists = 1;
+    while Instant::now() < deadline {
+        exists = redis::cmd("EXISTS")
+            .arg(key.as_str())
+            .query(&mut conn)
+            .expect("exists");
+        if exists == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    if exists != 0 {
+        let _: i64 = redis::cmd("DEL")
+            .arg(key.as_str())
+            .query(&mut conn)
+            .expect("cleanup");
+    }
+    assert_eq!(exists, 0, "Drop must retry the failed release");
 }
